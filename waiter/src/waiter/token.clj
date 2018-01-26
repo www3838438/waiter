@@ -218,7 +218,8 @@
             (make-peer-requests-fn "tokens/refresh"
                                    :body (json/write-str {:owner token-owner, :token token})
                                    :method :post)
-            (utils/map->json-response {:delete token, :hard-delete hard-delete, :success true}))
+            (utils/map->json-response {:delete token, :hard-delete hard-delete, :success true}
+                                      :headers {"etag" version-etag}))
           (throw (ex-info (str "Token " token " does not exist")
                           {:status 404 :token token}))))
       (throw (ex-info "Couldn't find token in request" {:status 400 :token token})))))

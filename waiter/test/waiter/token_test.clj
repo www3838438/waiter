@@ -198,11 +198,12 @@
           (->> (assoc service-description1 "owner" "tu1" "last-update-time" (- (clock-millis) 1000))
                (kv/store kv-store token))
           (is (not (nil? (kv/fetch kv-store token))))
-          (let [{:keys [body status]}
+          (let [token-etag (str (- (clock-millis) 1000))
+                {:keys [body headers status]}
                 (run-handle-token-request
                   kv-store waiter-hostnames entitlement-manager make-peer-requests-fn nil
                   {:authorization/user "tu1"
-                   :headers {"if-match" (str (- (clock-millis) 1000))
+                   :headers {"if-match" token-etag
                              "x-waiter-token" token}
                    :query-params {"hard-delete" "true"}
                    :request-method :delete})]
@@ -210,6 +211,7 @@
             (is (str/includes? body (str "\"delete\":\"" token "\"")))
             (is (str/includes? body "\"hard-delete\":true"))
             (is (str/includes? body "\"success\":true"))
+            (is (= token-etag (get headers "etag")))
             (is (nil? (kv/fetch kv-store token)) "Entry not deleted from kv-store!"))
           (finally
             (kv/delete kv-store token))))
