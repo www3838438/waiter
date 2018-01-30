@@ -243,7 +243,9 @@
           (cond-> service-description-template
                   show-metadata (merge (cond-> token-metadata
                                                (contains? token-metadata "last-update-time")
-                                               (update "last-update-time" #(DateTime. %)))))
+                                               (update "last-update-time" #(DateTime. %))
+                                               (not (contains? token-metadata "root"))
+                                               (assoc "root" (first waiter-hostnames)))))
           :headers {"etag" token-etag}))
       (do
         (throw (ex-info (str "Couldn't find token " token)
@@ -269,7 +271,7 @@
         version-etag (get headers "if-match")]
     (when (str/blank? token)
       (throw (ex-info "Must provide the token" {:status 400})))
-    (when (contains? waiter-hostnames token)
+    (when (some #(= token %) waiter-hostnames)
       (throw (ex-info "Token name is reserved" {:status 403 :token token})))
     (when-not (re-matches valid-token-re token)
       (throw (ex-info "Token must match pattern"
@@ -327,6 +329,10 @@
         (when (contains? new-token-metadata "last-update-time")
           (throw (ex-info "Cannot modify last-update-time token metadata"
                           {:status 400
+                           :token-metadata new-token-metadata})))
+        (when (contains? new-token-metadata "root")
+          (throw (ex-info "Cannot modify root token metadata"
+                          {:status 400
                            :token-metadata new-token-metadata}))))
       (throw (ex-info "Invalid update-mode"
                       {:mode (get request-params "update-mode")
@@ -334,7 +340,9 @@
 
     ; Store the token
     (let [new-token-metadata (merge {"last-update-time" (.getMillis ^DateTime (clock))
-                                     "owner" owner}
+                                     "owner" owner
+                                     "root" (or (get existing-token-metadata "root")
+                                                (first waiter-hostnames))}
                                     new-token-metadata)]
       (store-service-description-for-token synchronize-fn kv-store token new-service-description-template new-token-metadata
                                            :version-etag version-etag)
