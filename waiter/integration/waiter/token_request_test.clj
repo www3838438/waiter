@@ -17,6 +17,7 @@
             [plumbing.core :as pc]
             [qbits.jet.client.http :as http]
             [waiter.client-tools :refer :all]
+            [waiter.service-description :as sd]
             [waiter.utils :as utils])
   (:import (java.net URL)
            (org.joda.time DateTime)))
@@ -152,7 +153,7 @@
             (assert-response-status response 200)
             (is (get headers "etag"))
             (is (= (get headers "etag")
-                   (-> body json/read-str (get "last-update-time") utils/str-to-date .getMillis str))))))
+                   (->> body json/read-str (sd/service-description->service-id "E")))))))
 
       (log/info "ensuring tokens can be retrieved and listed on each router")
       (doseq [token tokens-to-create]
@@ -164,6 +165,8 @@
           (let [{:keys [body] :as tokens-response} (list-tokens router-url current-user :cookies cookies)
                 tokens (json/read-str body)]
             (assert-response-status tokens-response 200)
+            (is (every? (fn [token-entry] (contains? token-entry "deleted")) tokens))
+            (is (every? (fn [token-entry] (contains? token-entry "etag")) tokens))
             (is (some (fn [token-entry] (= token (get token-entry "token"))) tokens)))))
 
       (log/info "soft-deleting the tokens")
@@ -188,11 +191,23 @@
           (let [{:keys [body] :as tokens-response} (list-tokens router-url current-user :cookies cookies)
                 tokens (json/read-str body)]
             (assert-response-status tokens-response 200)
-            (is (not-any? (fn [token-entry] (= token (get token-entry "token"))) tokens)))))
+            (is (every? (fn [token-entry] (contains? token-entry "deleted")) tokens))
+            (is (every? (fn [token-entry] (contains? token-entry "etag")) tokens))
+            (is (some (fn [token-entry] (= token (get token-entry "token"))) tokens)))))
 
       (log/info "hard-deleting the tokens")
       (doseq [token tokens-to-create]
-        (delete-token-and-assert waiter-url token))
+        (delete-token-and-assert waiter-url token)
+        (doseq [[_ router-url] (routers waiter-url)]
+          (let [{:keys [body] :as response} (get-token router-url token :cookies cookies)]
+            (assert-response-status response 404)
+            (is (str/includes? (str body) "Couldn't find token") (str body)))
+          (let [{:keys [body] :as tokens-response} (list-tokens router-url current-user :cookies cookies)
+                tokens (json/read-str body)]
+            (assert-response-status tokens-response 200)
+            (is (every? (fn [token-entry] (contains? token-entry "deleted")) tokens))
+            (is (every? (fn [token-entry] (contains? token-entry "etag")) tokens))
+            (is (not-any? (fn [token-entry] (= token (get token-entry "token"))) tokens)))))
 
       (log/info "ensuring tokens can no longer be retrieved on each router with include=deleted parameter after hard-delete")
       (doseq [token tokens-to-create]

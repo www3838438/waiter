@@ -10,7 +10,6 @@
 ;;
 (ns waiter.token
   (:require [clojure.data.json :as json]
-            [clojure.set :as set]
             [clojure.string :as str]
             [clojure.tools.logging :as log]
             [ring.middleware.params :as ring-params]
@@ -23,20 +22,25 @@
 (def ^:const ANY-USER "*")
 (def ^:const valid-token-re #"[a-zA-Z]([a-zA-Z0-9\-_$\.])+")
 
-(let [default-etag 0]
-  (defn- token-metadata->etag
-    "Converts the token metadata to a tag"
-    [token-metadata]
-    (-> token-metadata
-        (get "last-update-time")
-        (or default-etag)
-        str)))
+(let [default-etag "0"]
+  (defn token-config->etag
+    "Converts the token config (merged map of service-description and token-metadata) to an etag."
+    [token-config]
+    (if (seq token-config)
+      (sd/service-description->service-id "E" token-config)
+      default-etag)))
+
+(defn- token-description->etag
+  "Converts the token metadata to an etag."
+  [{:keys [service-description-template token-metadata]}]
+  (-> (merge service-description-template token-metadata)
+      token-config->etag))
 
 (defn- validate-token-modification-based-on-etag
   "Validates whether the token modification should be allowed on based on the provided etag."
-  [token-metadata version-etag]
+  [{:keys [token-metadata] :as token-description} version-etag]
   (when version-etag
-    (when (not= (token-metadata->etag token-metadata) (str version-etag))
+    (when (not= (token-description->etag token-description) (str version-etag))
       (throw (ex-info "Cannot modify stale token"
                       {:etag version-etag
                        :status 412
@@ -49,7 +53,7 @@
 
 (let [token-lock "TOKEN_LOCK"
       token-owners-key "^TOKEN_OWNERS"
-      update-kv (fn update-kv [kv-store k f]
+      update-kv! (fn update-kv [kv-store k f]
                   (->> (kv/fetch kv-store k :refresh true)
                        f
                        (kv/store kv-store k)))
@@ -61,7 +65,24 @@
                          (or (get owner->owner-key owner)
                              (let [new-owner-key (new-owner-key)]
                                (kv/store kv-store token-owners-key (assoc owner->owner-key owner new-owner-key))
-                               new-owner-key)))]
+                               new-owner-key)))
+      token-index-sanitizer (fn token-index-sanitizer [index-entry]
+                              (if (string? index-entry)
+                                {:token index-entry} ;; backwards compatibility of data store
+                                index-entry))
+      delete-token-from-index (fn delete-token-from-index [index-entries token-to-remove]
+                                (->> index-entries
+                                     (map token-index-sanitizer)
+                                     (remove (fn entry-remover [{:keys [token]}] (= token token-to-remove)))
+                                     set))
+      insert-token-into-index (fn insert-token-into-index [index-entries token-to-insert token-etag deleted]
+                                (->> index-entries
+                                     (map token-index-sanitizer)
+                                     (remove (fn duplicate-remover [{:keys [token]}] (= token token-to-insert)))
+                                     (concat [{:deleted (true? deleted)
+                                               :etag token-etag
+                                               :token token-to-insert}])
+                                     set))]
 
   (defn store-service-description-for-token
     "Store the token mapping of the service description template in the key-value store."
@@ -71,9 +92,10 @@
       (fn inner-store-service-description-for-token []
         (log/info "storing service description for token:" token)
         (let [token-description (merge service-description-template (select-keys token-metadata sd/token-metadata-keys))
-              {:strs [owner] :as filtered-service-desc} (sd/sanitize-service-description token-description sd/token-description-keys)
-              existing-token-description (kv/fetch kv-store token :refresh true)
-              existing-owner (get existing-token-description "owner")
+              {:strs [deleted owner] :as filtered-service-desc} (sd/sanitize-service-description token-description sd/token-description-keys)
+              existing-token-config (kv/fetch kv-store token :refresh true)
+              existing-token-description (sd/token-config->token-description existing-token-config)
+              existing-owner (get existing-token-config "owner")
               owner->owner-key (kv/fetch kv-store token-owners-key)]
           ; Validate the token modification for concurrency races
           (validate-token-modification-based-on-etag existing-token-description version-etag)
@@ -82,11 +104,12 @@
           ; Remove token from previous owner
           (when (and existing-owner (not= owner existing-owner))
             (let [previous-owner-key (ensure-owner-key kv-store owner->owner-key existing-owner)]
-              (update-kv kv-store previous-owner-key (fn [v] (disj v token)))))
+              (update-kv! kv-store previous-owner-key (fn [index] (delete-token-from-index index token)))))
           ; Add token to new owner
           (when owner
-            (let [owner-key (ensure-owner-key kv-store owner->owner-key owner)]
-              (update-kv kv-store owner-key (fn [v] (conj (or v #{}) token)))))
+            (let [owner-key (ensure-owner-key kv-store owner->owner-key owner)
+                  token-etag' (token-config->etag filtered-service-desc)]
+              (update-kv! kv-store owner-key (fn [index] (insert-token-into-index index token token-etag' deleted)))))
           (log/info "stored service description template for" token)))))
 
   (defn delete-service-description-for-token
@@ -97,21 +120,25 @@
       token-lock
       (fn inner-delete-service-description-for-token []
         (log/info "attempting to delete service description for token:" token " hard-delete:" hard-delete)
-        (let [existing-token-description (kv/fetch kv-store token)]
+        (let [existing-token-config (kv/fetch kv-store token)
+              existing-token-description (sd/token-config->token-description existing-token-config)]
           ; Validate the token modification for concurrency races
           (validate-token-modification-based-on-etag existing-token-description version-etag)
           (if hard-delete
             (kv/delete kv-store token)
-            (when existing-token-description
-              (let [new-token-description (assoc existing-token-description
-                                            "deleted" true
-                                            "last-update-time" (.getMillis ^DateTime (clock)))]
-                (kv/store kv-store token new-token-description)))))
-        ; Remove token from owner
+            (when existing-token-config
+              (let [new-token-config (assoc existing-token-config
+                                       "deleted" true
+                                       "last-update-time" (.getMillis ^DateTime (clock)))]
+                (kv/store kv-store token new-token-config)))))
+        ; Remove token from owner (hard-delete) or set the deleted flag (soft-delete)
         (when owner
           (let [owner->owner-key (kv/fetch kv-store token-owners-key)
                 owner-key (ensure-owner-key kv-store owner->owner-key owner)]
-            (update-kv kv-store owner-key (fn [v] (disj v token)))))
+            (update-kv! kv-store owner-key (fn [index] (delete-token-from-index index token)))
+            (when (not hard-delete)
+              (let [etag (token-config->etag (kv/fetch kv-store token))]
+                (update-kv! kv-store owner-key (fn [index] (insert-token-into-index index token etag true)))))))
         ; Don't bother removing owner from token-owners, even if they have no tokens now
         (log/info "deleted token for" token))))
 
@@ -133,12 +160,14 @@
       (doseq [[_ owner-key] owner->owner-key]
         (kv/fetch kv-store owner-key :refresh true))))
 
-  (defn list-tokens-for-owner
+  (defn list-index-entries-for-owner
     "List all tokens for a given user."
     [kv-store owner]
     (set (let [owner->owner-key (kv/fetch kv-store token-owners-key)
                owner-key (ensure-owner-key kv-store owner->owner-key owner)]
-           (kv/fetch kv-store owner-key))))
+           (->> (kv/fetch kv-store owner-key)
+                (map token-index-sanitizer)
+                set))))
 
   (defn list-token-owners
     "List token owners."
@@ -165,23 +194,31 @@
               (kv/delete kv-store owner-key)))
           ; Delete owner map
           (kv/delete kv-store token-owners-key))
-        (let [owner->tokens (->> tokens
-                                 (map (fn [token] (let [{:strs [owner]} (kv/fetch kv-store token)]
-                                                    {:owner owner
-                                                     :token token})))
-                                 (filter :owner)
-                                 (group-by :owner))
-              owner->owner-key (->> owner->tokens
+        (let [owner->index-entries (->> tokens
+                                        set
+                                        (map
+                                          (fn [token]
+                                            (let [{:strs [deleted owner] :as token-config} (kv/fetch kv-store token)
+                                                  token-etag (token-config->etag token-config)]
+                                              (cond-> {:deleted (true? deleted)
+                                                       :owner owner
+                                                       :token token}
+                                                      token-etag (assoc :etag token-etag)))))
+                                        (filter :owner)
+                                        (group-by :owner))
+              owner->owner-key (->> owner->index-entries
                                     keys
                                     (map (fn [owner] [owner (new-owner-key)]))
                                     (into {}))]
           ; Create new owner map
           (kv/store kv-store token-owners-key owner->owner-key)
           ; Write each owner node
-          (doseq [[owner tokens] owner->tokens]
+          (doseq [[owner index-entries] owner->index-entries]
             (let [owner-key (get owner->owner-key owner)
-                  token-set (->> tokens (map :token) set)]
-              (kv/store kv-store owner-key token-set))))))))
+                  index-entries (->> index-entries
+                                     (map #(select-keys % [:etag :token]))
+                                     set)]
+              (kv/store kv-store owner-key index-entries))))))))
 
 (defn- handle-delete-token-request
   "Deletes the token configuration if found."
@@ -234,7 +271,7 @@
         {:keys [token]} (sd/retrieve-token-from-service-description-or-hostname headers headers waiter-hostnames)
         token-description (sd/token->token-description kv-store token :include-deleted include-deleted)
         {:keys [service-description-template token-metadata]} token-description
-        token-etag (token-metadata->etag token-metadata)]
+        token-etag (token-description->etag token-description)]
     (if (and service-description-template (not-empty service-description-template))
       ;;NB do not ever return the password to the user
       (do
@@ -352,7 +389,9 @@
                              :body (json/write-str {:token token, :owner owner}))
       (utils/map->json-response {:message (str "Successfully created " token)
                                  :service-description new-service-description-template}
-                                :headers {"etag" (token-metadata->etag new-token-metadata)}))))
+                                :headers {"etag" (-> {:service-description-template new-service-description-template
+                                                      :token-metadata new-token-metadata}
+                                                     token-description->etag)}))))
 
 (defn handle-token-request
   "Ring handler for dealing with tokens.
@@ -385,8 +424,12 @@
                  owner (get request-params "owner")
                  owners (if owner #{owner} (list-token-owners kv-store))]
              (->> owners
-                  (map (fn [owner] (->> (list-tokens-for-owner kv-store owner)
-                                        (map (fn [v] {:token v, :owner owner})))))
+                  (map
+                    (fn [owner]
+                      (->> (list-index-entries-for-owner kv-store owner)
+                           (map
+                             (fn [entry]
+                               (assoc entry :owner owner))))))
                   flatten
                   utils/map->streaming-json-response))
       (throw (ex-info "Only GET supported" {:request-method request-method
