@@ -148,12 +148,18 @@
 
       (testing "token retrieval - presence of etag header"
         (doseq [token tokens-to-create]
-          (let [{:keys [body headers] :as response}
-                (get-token waiter-url token :cookies cookies)]
+          (let [{:keys [body headers] :as response} (get-token waiter-url token :cookies cookies)
+                actual-etag (get headers "etag")]
             (assert-response-status response 200)
-            (is (get headers "etag"))
-            (is (= (get headers "etag")
-                   (->> body json/read-str (sd/service-description->service-id "E")))))))
+            (is actual-etag)
+            (when actual-etag
+              (let [convert-last-update-time (fn [{:strs [last-update-time] :as service-description}]
+                                               (cond-> service-description
+                                                       last-update-time
+                                                       (assoc "last-update-time"
+                                                              (-> last-update-time utils/str-to-date .getMillis))))
+                    expected-etag (->> body json/read-str convert-last-update-time utils/parameters->id (str "E-"))]
+                (is (= expected-etag actual-etag)))))))
 
       (log/info "ensuring tokens can be retrieved and listed on each router")
       (doseq [token tokens-to-create]

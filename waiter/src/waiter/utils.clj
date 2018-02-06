@@ -517,3 +517,16 @@
           merge2 (fn [m1 m2]
                    (reduce merge-entry (or m1 {}) (seq m2)))]
       (reduce merge2 maps))))
+
+(defn parameters->id
+  [parameters]
+  (let [sorted-parameters (sort parameters)
+        id (loop [[[k v] & kvs] sorted-parameters
+                  acc (transient [])]
+             (if k
+               (recur kvs (-> acc
+                              (conj! k)
+                              (conj! (str v))))
+               (str (digest/digest "MD5" (str/join "" (persistent! acc))))))]
+    (log/debug "got ID" id "for" sorted-parameters)
+    id))

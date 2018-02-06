@@ -10,8 +10,10 @@
 ;;
 (ns waiter.token
   (:require [clojure.data.json :as json]
+            [clojure.set :as set]
             [clojure.string :as str]
             [clojure.tools.logging :as log]
+            [plumbing.core :as pc]
             [ring.middleware.params :as ring-params]
             [waiter.authorization :as authz]
             [waiter.kv :as kv]
@@ -22,19 +24,22 @@
 (def ^:const ANY-USER "*")
 (def ^:const valid-token-re #"[a-zA-Z]([a-zA-Z0-9\-_$\.])+")
 
-(let [default-etag "0"]
-  (defn kv-data->etag
+(let [etag-prefix "E-"
+      default-etag (str etag-prefix "0")]
+  (defn token-data->etag
     "Converts the merged map of service-description and token-metadata to an etag."
-    [kv-data]
-    (if (seq kv-data)
-      (sd/service-description->service-id "E" kv-data)
+    [token-data]
+    (if (seq token-data)
+      (str etag-prefix (-> token-data
+                           (select-keys sd/token-data-keys)
+                           utils/parameters->id))
       default-etag)))
 
 (defn- token-description->etag
   "Converts the token metadata to an etag."
   [{:keys [service-description-template token-metadata]}]
   (-> (merge service-description-template token-metadata)
-      kv-data->etag))
+      token-data->etag))
 
 (defn- validate-token-modification-based-on-etag
   "Validates whether the token modification should be allowed on based on the provided etag."
@@ -66,23 +71,18 @@
                              (let [new-owner-key (new-owner-key)]
                                (kv/store kv-store token-owners-key (assoc owner->owner-key owner new-owner-key))
                                new-owner-key)))
-      token-index-sanitizer (fn token-index-sanitizer [index-entry]
-                              (if (string? index-entry)
-                                {:token index-entry} ;; backwards compatibility of data store
-                                index-entry))
+      token-index-sanitizer (fn token-index-sanitizer [index-entries]
+                              (if (set? index-entries) ;; backwards compatibility of data store
+                                (pc/map-from-keys (fn [_] {}) index-entries)
+                                index-entries))
       delete-token-from-index (fn delete-token-from-index [index-entries token-to-remove]
-                                (->> index-entries
-                                     (map token-index-sanitizer)
-                                     (remove (fn entry-remover [{:keys [token]}] (= token token-to-remove)))
-                                     set))
+                                (-> index-entries
+                                    token-index-sanitizer
+                                    (dissoc token-to-remove)))
       insert-token-into-index (fn insert-token-into-index [index-entries token-to-insert token-etag deleted]
-                                (->> index-entries
-                                     (map token-index-sanitizer)
-                                     (remove (fn duplicate-remover [{:keys [token]}] (= token token-to-insert)))
-                                     (concat [{:deleted (true? deleted)
-                                               :etag token-etag
-                                               :token token-to-insert}])
-                                     set))]
+                                (-> index-entries
+                                    token-index-sanitizer
+                                    (assoc token-to-insert {:deleted (true? deleted) :etag token-etag})))]
 
   (defn store-service-description-for-token
     "Store the token mapping of the service description template in the key-value store."
@@ -92,15 +92,15 @@
       (fn inner-store-service-description-for-token []
         (log/info "storing service description for token:" token)
         (let [token-description (merge service-description-template (select-keys token-metadata sd/token-metadata-keys))
-              {:strs [deleted owner] :as filtered-service-desc} (sd/sanitize-service-description token-description sd/token-description-keys)
-              existing-kv-data (kv/fetch kv-store token :refresh true)
-              existing-token-description (sd/kv-data->token-description existing-kv-data)
-              existing-owner (get existing-kv-data "owner")
+              {:strs [deleted owner] :as new-token-data} (sd/sanitize-service-description token-description sd/token-data-keys)
+              existing-token-data (kv/fetch kv-store token :refresh true)
+              existing-token-description (sd/token-data->token-description existing-token-data)
+              existing-owner (get existing-token-data "owner")
               owner->owner-key (kv/fetch kv-store token-owners-key)]
           ; Validate the token modification for concurrency races
           (validate-token-modification-based-on-etag existing-token-description version-etag)
           ; Store the service description
-          (kv/store kv-store token filtered-service-desc)
+          (kv/store kv-store token new-token-data)
           ; Remove token from previous owner
           (when (and existing-owner (not= owner existing-owner))
             (let [previous-owner-key (ensure-owner-key kv-store owner->owner-key existing-owner)]
@@ -108,7 +108,7 @@
           ; Add token to new owner
           (when owner
             (let [owner-key (ensure-owner-key kv-store owner->owner-key owner)
-                  token-etag' (kv-data->etag filtered-service-desc)]
+                  token-etag' (token-data->etag new-token-data)]
               (update-kv! kv-store owner-key (fn [index] (insert-token-into-index index token token-etag' deleted)))))
           (log/info "stored service description template for" token)))))
 
@@ -120,24 +120,24 @@
       token-lock
       (fn inner-delete-service-description-for-token []
         (log/info "attempting to delete service description for token:" token " hard-delete:" hard-delete)
-        (let [existing-kv-data (kv/fetch kv-store token)
-              existing-token-description (sd/kv-data->token-description existing-kv-data)]
+        (let [existing-token-data (kv/fetch kv-store token)
+              existing-token-description (sd/token-data->token-description existing-token-data)]
           ; Validate the token modification for concurrency races
           (validate-token-modification-based-on-etag existing-token-description version-etag)
           (if hard-delete
             (kv/delete kv-store token)
-            (when existing-kv-data
-              (let [new-kv-data (assoc existing-kv-data
-                                  "deleted" true
-                                  "last-update-time" (.getMillis ^DateTime (clock)))]
-                (kv/store kv-store token new-kv-data)))))
+            (when existing-token-data
+              (let [new-token-data (assoc existing-token-data
+                                     "deleted" true
+                                     "last-update-time" (.getMillis ^DateTime (clock)))]
+                (kv/store kv-store token new-token-data)))))
         ; Remove token from owner (hard-delete) or set the deleted flag (soft-delete)
         (when owner
           (let [owner->owner-key (kv/fetch kv-store token-owners-key)
                 owner-key (ensure-owner-key kv-store owner->owner-key owner)]
             (update-kv! kv-store owner-key (fn [index] (delete-token-from-index index token)))
             (when (not hard-delete)
-              (let [etag (kv-data->etag (kv/fetch kv-store token))]
+              (let [etag (token-data->etag (kv/fetch kv-store token))]
                 (update-kv! kv-store owner-key (fn [index] (insert-token-into-index index token etag true)))))))
         ; Don't bother removing owner from token-owners, even if they have no tokens now
         (log/info "deleted token for" token))))
@@ -163,11 +163,10 @@
   (defn list-index-entries-for-owner
     "List all tokens for a given user."
     [kv-store owner]
-    (set (let [owner->owner-key (kv/fetch kv-store token-owners-key)
-               owner-key (ensure-owner-key kv-store owner->owner-key owner)]
-           (->> (kv/fetch kv-store owner-key)
-                (map token-index-sanitizer)
-                set))))
+    (let [owner->owner-key (kv/fetch kv-store token-owners-key)
+          owner-key (ensure-owner-key kv-store owner->owner-key owner)]
+      (-> (kv/fetch kv-store owner-key)
+          token-index-sanitizer)))
 
   (defn list-token-owners
     "List token owners."
@@ -194,30 +193,29 @@
               (kv/delete kv-store owner-key)))
           ; Delete owner map
           (kv/delete kv-store token-owners-key))
-        (let [owner->index-entries (->> tokens
-                                        set
-                                        (map
-                                          (fn [token]
-                                            (let [{:strs [deleted owner] :as kv-data} (kv/fetch kv-store token)
-                                                  token-etag (kv-data->etag kv-data)]
-                                              (cond-> {:deleted (true? deleted)
-                                                       :owner owner
-                                                       :token token}
-                                                      token-etag (assoc :etag token-etag)))))
-                                        (filter :owner)
-                                        (group-by :owner))
-              owner->owner-key (->> owner->index-entries
-                                    keys
-                                    (map (fn [owner] [owner (new-owner-key)]))
-                                    (into {}))]
+        (let [owner->tokens (->> tokens
+                                 (map (fn [token] (let [{:strs [owner]} (kv/fetch kv-store token)]
+                                                    {:owner owner
+                                                     :token token})))
+                                 (filter :owner)
+                                 (group-by :owner)
+                                 (pc/map-vals (fn [entries] (map :token entries))))
+              owner->index-entries (pc/map-vals
+                                     (fn [tokens]
+                                       (pc/map-from-keys
+                                         (fn [token]
+                                           (let [{:strs [deleted] :as token-data} (kv/fetch kv-store token)
+                                                 token-etag (token-data->etag token-data)]
+                                             {:deleted (true? deleted)
+                                              :etag token-etag}))
+                                         tokens))
+                                     owner->tokens)
+              owner->owner-key (pc/map-from-keys (fn [_] (new-owner-key)) (keys owner->index-entries))]
           ; Create new owner map
           (kv/store kv-store token-owners-key owner->owner-key)
           ; Write each owner node
           (doseq [[owner index-entries] owner->index-entries]
-            (let [owner-key (get owner->owner-key owner)
-                  index-entries (->> index-entries
-                                     (map #(select-keys % [:etag :token]))
-                                     set)]
+            (let [owner-key (get owner->owner-key owner)]
               (kv/store kv-store owner-key index-entries))))))))
 
 (defn- handle-delete-token-request
@@ -314,8 +312,11 @@
       (throw (ex-info "Token must match pattern"
                       {:status 400 :token token :pattern (str valid-token-re)})))
     (validate-service-description-fn new-service-description-template)
-    (let [unknown-keys (apply disj (-> new-token-description keys set)
-                              "token" sd/token-description-keys)]
+    (let [unknown-keys (-> new-token-description
+                           keys
+                           set
+                           (set/difference sd/token-data-keys)
+                           (disj "token"))]
       (when (not-empty unknown-keys)
         (throw (ex-info (str "Unsupported key(s) in token: " (str (vec unknown-keys)))
                         {:status 400 :token token}))))
@@ -429,12 +430,12 @@
                   (map
                     (fn [owner]
                       (->> (list-index-entries-for-owner kv-store owner)
-                           (remove (fn [entry]
-                                     (and (not include-deleted)
-                                          (:deleted entry))))
+                           (filter
+                             (fn [[_ entry]]
+                               (or include-deleted (not (:deleted entry)))))
                            (map
-                             (fn [entry]
-                               (cond-> (assoc entry :owner owner)
+                             (fn [[token entry]]
+                               (cond-> (assoc entry :owner owner :token token)
                                        (not show-metadata)
                                        (dissoc :deleted :etag)))))))
                   flatten

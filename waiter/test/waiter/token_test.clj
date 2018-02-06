@@ -200,7 +200,7 @@
           (try
             (kv/store kv-store token service-description1')
             (is (not (nil? (kv/fetch kv-store token))))
-            (let [token-etag (kv-data->etag service-description1')
+            (let [token-etag (token-data->etag service-description1')
                   {:keys [body headers status]}
                   (run-handle-token-request
                     kv-store waiter-hostnames entitlement-manager make-peer-requests-fn nil
@@ -260,7 +260,7 @@
                  :body (StringBufferInputStream. (json/write-str service-description1))})]
           (is (= 200 status))
           (is (str/includes? body (str "Successfully created " token)))
-          (is (= (select-keys service-description1 sd/token-description-keys)
+          (is (= (select-keys service-description1 sd/token-data-keys)
                  (sd/token->service-description-template kv-store token)))
           (let [{:keys [service-description-template token-metadata]} (sd/token->token-description kv-store token)]
             (is (= (dissoc service-description1 "token") service-description-template))
@@ -273,7 +273,7 @@
                 kv-store
                 {:authorization/user "tu1", :query-string "include=metadata", :request-method :get})]
           (is (= 200 status))
-          (is (= [{"deleted" false, "etag" (kv-data->etag (kv/fetch kv-store token)), "owner" "tu1", "token" token}]
+          (is (= [{"deleted" false, "etag" (token-data->etag (kv/fetch kv-store token)), "owner" "tu1", "token" token}]
                  (json/read-str body)))))
 
       (testing "post:new-service-description-different-owner"
@@ -286,7 +286,7 @@
                                                                                              "token" token)))})]
           (is (= 200 status))
           (is (str/includes? body (str "Successfully created " token)))
-          (is (= (select-keys service-description1 sd/token-description-keys)
+          (is (= (select-keys service-description1 sd/token-data-keys)
                  (sd/token->service-description-template kv-store token)))
           (let [{:keys [service-description-template token-metadata]} (sd/token->token-description kv-store token)]
             (is (= (dissoc service-description1 "token") service-description-template))
@@ -315,7 +315,7 @@
                  :body (StringBufferInputStream. (json/write-str service-description2))})]
           (is (= 200 status))
           (is (str/includes? body (str "Successfully created " token)))
-          (is (= (select-keys service-description2 sd/token-description-keys)
+          (is (= (select-keys service-description2 sd/token-data-keys)
                  (sd/token->service-description-template kv-store token)))
           (let [{:keys [service-description-template token-metadata]} (sd/token->token-description kv-store token)]
             (is (= (dissoc service-description2 "token") service-description-template))
@@ -331,7 +331,7 @@
                  :body (StringBufferInputStream. (json/write-str (assoc service-description2 "owner" "tu2")))})]
           (is (= 200 status))
           (is (str/includes? body (str "Successfully created " token)))
-          (is (= (select-keys service-description2 sd/token-description-keys)
+          (is (= (select-keys service-description2 sd/token-data-keys)
                  (sd/token->service-description-template kv-store token)))
           (let [{:keys [service-description-template token-metadata]} (sd/token->token-description kv-store token)]
             (is (= (dissoc service-description2 "token") service-description-template))
@@ -348,7 +348,7 @@
           (is (= 200 status))
           (is (= "application/json" (get headers "content-type")))
           (is (str/includes? body (str "Successfully created " token)))
-          (is (= (select-keys service-description2 sd/token-description-keys)
+          (is (= (select-keys service-description2 sd/token-data-keys)
                  (sd/token->service-description-template kv-store token)))
           (let [{:keys [service-description-template token-metadata]} (sd/token->token-description kv-store token)]
             (is (= (dissoc service-description2 "token") service-description-template))
@@ -507,7 +507,7 @@
                 kv-store waiter-hostnames entitlement-manager make-peer-requests-fn (constantly true)
                 {:authorization/user test-user
                  :body (StringBufferInputStream. (json/write-str service-description))
-                 :headers {"if-match" "0"
+                 :headers {"if-match" "E-0" ;; EO is the default etag
                            "x-waiter-token" token}
                  :query-params {"update-mode" "admin"}
                  :request-method :post})]
@@ -854,8 +854,8 @@
         (is (= (merge service-description-1 token-metadata-1) token-description))))
 
     (testing "basic update with valid etag"
-      (let [kv-data (kv/fetch kv-store token)
-            token-etag (kv-data->etag kv-data)]
+      (let [token-data (kv/fetch kv-store token)
+            token-etag (token-data->etag token-data)]
         (store-service-description-for-token synchronize-fn kv-store token service-description-2 token-metadata-2
                                              :version-etag token-etag)
         (let [token-description (kv/fetch kv-store token)]
@@ -898,23 +898,24 @@
     (is (= (-> owner->owner-key keys set) (list-token-owners kv-store)))
     (is (= owner->owner-key (token-owners-map kv-store)))
     (is (= #{"token-1", "token-2"} (kv/fetch kv-store (owner->owner-key user-1))))
-    (is (= #{{:token "token-1"} {:token "token-2"}} (list-index-entries-for-owner kv-store user-1)))
+    (is (= {"token-1" {} "token-2" {}} (list-index-entries-for-owner kv-store user-1)))
     (is (= #{"token-3"} (kv/fetch kv-store (owner->owner-key user-2))))
-    (is (= #{{:token "token-3"}} (list-index-entries-for-owner kv-store user-2)))
+    (is (= {"token-3" {}} (list-index-entries-for-owner kv-store user-2)))
 
     (let [service-description-2' (assoc service-description-2 "version" "b2.2")
-          token-metadata-2' (assoc token-metadata-2 "owner" user-2, "last-update-time" current-time)]
+          token-metadata-2' (assoc token-metadata-2 "owner" user-2, "last-update-time" current-time)
+          token-data-2' (merge service-description-2' token-metadata-2')]
       (store-service-description-for-token synchronize-fn kv-store "token-2" service-description-2' token-metadata-2')
 
       ;; assert that the newer format of data is saved everywhere
-      (is (= (merge service-description-2' token-metadata-2') (kv/fetch kv-store "token-2")))
+      (is (= token-data-2' (kv/fetch kv-store "token-2")))
       (is (= (-> owner->owner-key keys set) (list-token-owners kv-store)))
       (is (= owner->owner-key (token-owners-map kv-store)))
-      (is (= #{{:token "token-1"}} (kv/fetch kv-store (owner->owner-key user-1))))
-      (is (= #{{:token "token-1"}} (list-index-entries-for-owner kv-store user-1)))
-      (is (= #{{:deleted false, :etag (kv-data->etag service-description-2'), :token "token-2"}, {:token "token-3"}}
+      (is (= {"token-1" {}} (kv/fetch kv-store (owner->owner-key user-1))))
+      (is (= {"token-1" {}} (list-index-entries-for-owner kv-store user-1)))
+      (is (= {"token-2" {:deleted false, :etag (token-data->etag token-data-2')}, "token-3" {}}
              (kv/fetch kv-store (owner->owner-key user-2))))
-      (is (= #{{:deleted false, :etag (kv-data->etag service-description-2'), :token "token-2"}, {:token "token-3"}}
+      (is (= {"token-2" {:deleted false, :etag (token-data->etag token-data-2')}, "token-3" {}}
              (list-index-entries-for-owner kv-store user-2))))))
 
 (deftest test-delete-service-description-for-token
@@ -937,7 +938,7 @@
     (testing "valid soft delete with up-to-date etag"
       (kv/store kv-store token token-description)
       (is (= token-description (kv/fetch kv-store token)))
-      (let [token-etag (kv-data->etag token-description)]
+      (let [token-etag (token-data->etag token-description)]
         (delete-service-description-for-token clock synchronize-fn kv-store token owner
                                               :version-etag token-etag))
       (is (= (assoc token-description "last-update-time" current-time "deleted" true)
@@ -962,7 +963,7 @@
     (testing "valid hard delete with up-to-date etag"
       (kv/store kv-store token token-description)
       (is (= token-description (kv/fetch kv-store token)))
-      (let [token-etag (kv-data->etag token-description)]
+      (let [token-etag (token-data->etag token-description)]
         (delete-service-description-for-token clock synchronize-fn kv-store token owner
                                               :hard-delete true :version-etag token-etag))
       (is (nil? (kv/fetch kv-store token))))
@@ -995,7 +996,7 @@
     (is (= (-> owner->owner-key keys set) (list-token-owners kv-store)))
     (is (= owner->owner-key (token-owners-map kv-store)))
     (is (= #{"token-1", "token-2"} (kv/fetch kv-store (owner->owner-key user-1))))
-    (is (= #{{:token "token-1"} {:token "token-2"}}
+    (is (= {"token-1" {} "token-2" {}}
            (list-index-entries-for-owner kv-store user-1)))
 
     (delete-service-description-for-token clock synchronize-fn kv-store "token-2" user-1)
@@ -1003,10 +1004,12 @@
     ;; assert that the newer format of data is saved everywhere
     (is (= (-> owner->owner-key keys set) (list-token-owners kv-store)))
     (is (= owner->owner-key (token-owners-map kv-store)))
-    (let [token-2-etag (kv-data->etag (assoc service-description-2 "deleted" true))]
-      (is (= #{{:token "token-1"} {:deleted true :etag token-2-etag :token "token-2"}}
+    (let [metadata-2' {"deleted" true "last-update-time" current-time "owner" user-1}
+          token-data-2' (merge service-description-2 metadata-2')
+          token-2-etag (token-data->etag token-data-2')]
+      (is (= {"token-1" {}, "token-2" {:deleted true :etag token-2-etag}}
              (kv/fetch kv-store (owner->owner-key user-1))))
-      (is (= #{{:token "token-1"} {:deleted true :etag token-2-etag :token "token-2"}}
+      (is (= {"token-1" {}, "token-2" {:deleted true :etag token-2-etag}}
              (list-index-entries-for-owner kv-store user-1))))
 
     (delete-service-description-for-token clock synchronize-fn kv-store "token-2" user-1 :hard-delete true)
@@ -1014,10 +1017,8 @@
     ;; assert that hard-deleted token goes away
     (is (= (-> owner->owner-key keys set) (list-token-owners kv-store)))
     (is (= owner->owner-key (token-owners-map kv-store)))
-    (is (= #{{:token "token-1"}}
-           (kv/fetch kv-store (owner->owner-key user-1))))
-    (is (= #{{:token "token-1"}}
-           (list-index-entries-for-owner kv-store user-1)))))
+    (is (= {"token-1" {}} (kv/fetch kv-store (owner->owner-key user-1))))
+    (is (= {"token-1" {}} (list-index-entries-for-owner kv-store user-1)))))
 
 (deftest test-token-index
   (let [lock (Object.)
@@ -1031,10 +1032,10 @@
     (doseq [[token token-data] tokens]
       (kv/store kv-store token token-data))
     (reindex-tokens synchronize-fn kv-store (keys tokens))
-    (is (= #{{:etag (-> (get tokens "token2") kv-data->etag) :token "token2"}
-             {:etag (-> (get tokens "token1") kv-data->etag) :token "token1"}}
+    (is (= {"token1" {:deleted false :etag (-> (get tokens "token1") token-data->etag)}
+            "token2" {:deleted false :etag (-> (get tokens "token2") token-data->etag)}}
            (list-index-entries-for-owner kv-store "owner1")))
-    (is (= #{{:etag (-> (get tokens "token3") kv-data->etag)  :token "token3"}}
+    (is (= {"token3" {:deleted false :etag (-> (get tokens "token3") token-data->etag)}}
            (list-index-entries-for-owner kv-store "owner2")))))
 
 (deftest test-handle-reindex-tokens-request
@@ -1076,7 +1077,7 @@
         kv-store (kv/->LocalKeyValueStore (atom {}))
         handle-list-tokens-request (wrap-handler-json-response handle-list-tokens-request)
         last-update-time-seed (clock-millis)
-        token->etag (fn [token] (-> (kv/fetch kv-store token) kv-data->etag))]
+        token->etag (fn [token] (-> (kv/fetch kv-store token) token-data->etag))]
     (store-service-description-for-token
       synchronize-fn kv-store "token1" {"cpus" 1} {"last-update-time" (- last-update-time-seed 1000), "owner" "owner1"})
     (store-service-description-for-token
@@ -1168,9 +1169,9 @@
     (is (= (-> owner->owner-key keys set) (list-token-owners kv-store)))
     (is (= owner->owner-key (token-owners-map kv-store)))
     (is (= #{"token-1", "token-2"} (kv/fetch kv-store (owner->owner-key user-1))))
-    (is (= #{{:token "token-1"} {:token "token-2"}} (list-index-entries-for-owner kv-store user-1)))
+    (is (= {"token-1" {}, "token-2" {}} (list-index-entries-for-owner kv-store user-1)))
     (is (= #{"token-3"} (kv/fetch kv-store (owner->owner-key user-2))))
-    (is (= #{{:token "token-3"}} (list-index-entries-for-owner kv-store user-2)))
+    (is (= {"token-3" {}} (list-index-entries-for-owner kv-store user-2)))
 
     ;; assert that the older format of data is handled correctly
     (let [{:keys [body status]} (handle-list-tokens-request kv-store {:request-method :get})]
