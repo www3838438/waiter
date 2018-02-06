@@ -367,8 +367,10 @@
     (when (or (not deleted) include-deleted)
       data)))
 
-(defn token-config->token-description
-  "Retrieves the token description for the given token when the raw token config is provided."
+(defn kv-data->token-description
+  "Retrieves the token description for the given token when the raw kv data (merged value of service
+   parameters and metadata) is provided.
+   The token-description consists of the following keys: :service-description-template and :token-metadata"
   [config]
   {:service-description-template (select-keys config service-description-keys)
    :token-metadata (select-keys config token-metadata-keys)})
@@ -377,7 +379,7 @@
   "Retrieves the token description for the given token."
   [kv-store ^String token & {:keys [include-deleted] :or {include-deleted false}}]
   (let [config (token->kv-data kv-store token false include-deleted)]
-    (token-config->token-description config)))
+    (kv-data->token-description config)))
 
 (defn token->service-description-template
   "Retrieves the service description template for the given token."
