@@ -421,15 +421,22 @@
   (try
     (case request-method
       :get (let [request-params (:params (ring-params/params-request req))
+                 include-deleted (utils/param-contains? request-params "include" "deleted")
+                 show-metadata (utils/param-contains? request-params "include" "metadata")
                  owner (get request-params "owner")
                  owners (if owner #{owner} (list-token-owners kv-store))]
              (->> owners
                   (map
                     (fn [owner]
                       (->> (list-index-entries-for-owner kv-store owner)
+                           (remove (fn [entry]
+                                     (and (not include-deleted)
+                                          (:deleted entry))))
                            (map
                              (fn [entry]
-                               (assoc entry :owner owner))))))
+                               (cond-> (assoc entry :owner owner)
+                                       (not show-metadata)
+                                       (dissoc :deleted :etag)))))))
                   flatten
                   utils/map->streaming-json-response))
       (throw (ex-info "Only GET supported" {:request-method request-method

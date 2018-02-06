@@ -79,8 +79,8 @@
   (str service-id-prefix "." (subs waiter-url 0 (str/index-of waiter-url ":"))))
 
 (defn- list-tokens
-  [waiter-url owner & {:keys [cookies] :or {cookies {}}}]
-  (let [tokens-response (make-request waiter-url "/tokens" :cookies cookies)]
+  [waiter-url owner cookies query-params]
+  (let [tokens-response (make-request waiter-url "/tokens" :cookies cookies :query-params query-params)]
     (log/debug "retrieved tokens for owner " owner ":" (:body tokens-response))
     tokens-response))
 
@@ -162,7 +162,8 @@
               (assert-token-response primary-hostname service-id-prefix false false))
           (-> (get-token router-url token :cookies cookies :query-params {"include" "metadata"})
               (assert-token-response primary-hostname service-id-prefix false true))
-          (let [{:keys [body] :as tokens-response} (list-tokens router-url current-user :cookies cookies)
+          (let [{:keys [body] :as tokens-response}
+                (list-tokens router-url current-user cookies {"include" ["deleted" "metadata"]})
                 tokens (json/read-str body)]
             (assert-response-status tokens-response 200)
             (is (every? (fn [token-entry] (contains? token-entry "deleted")) tokens))
@@ -188,7 +189,15 @@
                          :cookies cookies
                          :query-params {"include" ["deleted" "metadata"]})
               (assert-token-response primary-hostname service-id-prefix true))
-          (let [{:keys [body] :as tokens-response} (list-tokens router-url current-user :cookies cookies)
+          (let [{:keys [body] :as tokens-response}
+                (list-tokens router-url current-user cookies {"include" ["metadata"]})
+                tokens (json/read-str body)]
+            (assert-response-status tokens-response 200)
+            (is (every? (fn [token-entry] (contains? token-entry "deleted")) tokens))
+            (is (every? (fn [token-entry] (contains? token-entry "etag")) tokens))
+            (is (not-any? (fn [token-entry] (= token (get token-entry "token"))) tokens)))
+          (let [{:keys [body] :as tokens-response}
+                (list-tokens router-url current-user cookies {"include" ["deleted" "metadata"]})
                 tokens (json/read-str body)]
             (assert-response-status tokens-response 200)
             (is (every? (fn [token-entry] (contains? token-entry "deleted")) tokens))
@@ -202,7 +211,8 @@
           (let [{:keys [body] :as response} (get-token router-url token :cookies cookies)]
             (assert-response-status response 404)
             (is (str/includes? (str body) "Couldn't find token") (str body)))
-          (let [{:keys [body] :as tokens-response} (list-tokens router-url current-user :cookies cookies)
+          (let [{:keys [body] :as tokens-response}
+                (list-tokens router-url current-user cookies {"include" ["deleted" "metadata"]})
                 tokens (json/read-str body)]
             (assert-response-status tokens-response 200)
             (is (every? (fn [token-entry] (contains? token-entry "deleted")) tokens))
