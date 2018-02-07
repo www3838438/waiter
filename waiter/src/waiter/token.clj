@@ -262,7 +262,7 @@
 (defn- handle-get-token-request
   "Returns the configuration if found.
    Anyone can see the configuration, b/c it shouldn't contain any sensitive data."
-  [kv-store waiter-hostnames {:keys [headers] :as request}]
+  [kv-store cluster-id waiter-hostnames {:keys [headers] :as request}]
   (let [request-params (:query-params (ring-params/params-request request))
         include-deleted (utils/param-contains? request-params "include" "deleted")
         show-metadata (utils/param-contains? request-params "include" "metadata")
@@ -280,7 +280,7 @@
                                                (contains? token-metadata "last-update-time")
                                                (update "last-update-time" #(DateTime. %))
                                                (not (contains? token-metadata "root"))
-                                               (assoc "root" (first waiter-hostnames)))))
+                                               (assoc "root" cluster-id))))
           :headers {"etag" token-etag}))
       (do
         (throw (ex-info (str "Couldn't find token " token)
@@ -291,8 +291,8 @@
 (defn- handle-post-token-request
   "Validates that the user is the creator of the token if it already exists.
    Then, updates the configuration for the token in the database using the newest password."
-  [clock synchronize-fn kv-store waiter-hostnames entitlement-manager make-peer-requests-fn validate-service-description-fn
-   {:keys [headers] :as request}]
+  [clock synchronize-fn kv-store cluster-id waiter-hostnames entitlement-manager make-peer-requests-fn
+   validate-service-description-fn {:keys [headers] :as request}]
   (let [request-params (:query-params (ring-params/params-request request))
         authenticated-user (get request :authorization/user)
         {:strs [token] :as new-token-description} (json/read-str (slurp (:body request)))
@@ -379,8 +379,7 @@
     ; Store the token
     (let [new-token-metadata (merge {"last-update-time" (.getMillis ^DateTime (clock))
                                      "owner" owner
-                                     "root" (or (get existing-token-metadata "root")
-                                                (first waiter-hostnames))}
+                                     "root" (or (get existing-token-metadata "root") cluster-id)}
                                     new-token-metadata)]
       (store-service-description-for-token synchronize-fn kv-store token new-service-description-template new-token-metadata
                                            :version-etag version-etag)
@@ -404,14 +403,14 @@
 
    If handling POST, validates that the user is the creator of the token if it already exists.
    Then, updates the configuration for the token in the database using the newest password."
-  [clock synchronize-fn kv-store waiter-hostnames entitlement-manager make-peer-requests-fn validate-service-description-fn
-   {:keys [request-method] :as request}]
+  [clock synchronize-fn kv-store cluster-id waiter-hostnames entitlement-manager make-peer-requests-fn
+   validate-service-description-fn {:keys [request-method] :as request}]
   (try
     (case request-method
       :delete (handle-delete-token-request clock synchronize-fn kv-store waiter-hostnames entitlement-manager
                                            make-peer-requests-fn request)
-      :get (handle-get-token-request kv-store waiter-hostnames request)
-      :post (handle-post-token-request clock synchronize-fn kv-store waiter-hostnames entitlement-manager
+      :get (handle-get-token-request kv-store cluster-id waiter-hostnames request)
+      :post (handle-post-token-request clock synchronize-fn kv-store cluster-id waiter-hostnames entitlement-manager
                                        make-peer-requests-fn validate-service-description-fn request)
       (throw (ex-info "Invalid request method" {:request-method request-method, :status 405})))
     (catch Exception ex

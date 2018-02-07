@@ -448,6 +448,10 @@
                            passwords]
                     (utils/create-component authenticator-config :context {:password (first passwords)}))
    :clock (pc/fnk [] t/now)
+   :cluster-id (pc/fnk [[:settings [:zookeeper base-path]]]
+                 ;; TODO ideally we would like to use cluster name but we have not required it to be unique in the past
+                 ;; TODO ZK base-path also reflects where the items are qritten per cluster and is a good temporary candidate
+                 (str/replace base-path #"[/]" ""))
    :cors-validator (pc/fnk [[:settings cors-config]]
                      (utils/create-component cors-config))
    :entitlement-manager (pc/fnk [[:settings entitlement-config]]
@@ -1222,14 +1226,14 @@
                         (fn status-handler-fn [_] {:body "ok" :headers {} :status 200}))
    :token-handler-fn (pc/fnk [[:curator kv-store]
                               [:routines make-inter-router-requests-sync-fn synchronize-fn validate-service-description-fn]
-                              [:state clock entitlement-manager waiter-hostnames]
+                              [:state clock cluster-id entitlement-manager waiter-hostnames]
                               handle-secure-request-fn]
                        (fn token-handler-fn [request]
                          (handle-secure-request-fn
                            (fn inner-token-handler-fn [request]
                              (token/handle-token-request
-                               clock synchronize-fn kv-store waiter-hostnames entitlement-manager make-inter-router-requests-sync-fn
-                               validate-service-description-fn request))
+                               clock synchronize-fn kv-store cluster-id waiter-hostnames entitlement-manager
+                               make-inter-router-requests-sync-fn validate-service-description-fn request))
                            request)))
    :token-list-handler-fn (pc/fnk [[:curator kv-store]
                                    handle-secure-request-fn]
